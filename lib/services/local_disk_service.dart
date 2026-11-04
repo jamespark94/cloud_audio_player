@@ -1,0 +1,580 @@
+import 'dart:io';
+import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../models/media_item.dart';
+import '../utils/permission_utils.dart';
+import 'cloud_service_interface.dart';
+
+class LocalDiskService extends CloudService {
+  static const String customStoragePrefKey = 'custom_local_storage_paths';
+
+  LocalDiskService(super.account, {super.onAccountUpdated});
+
+  @override
+  Future<List<MediaItem>> listItems({String? folderId}) async {
+    // Android 저장소 권한 선제적 확인/요청
+    if (Platform.isAndroid) {
+      await PermissionUtils.ensureStoragePermission();
+    }
+
+    // 1. 루트 목록 (드라이브, SD 카드, 사용자 추가 저장소 및 빠른 접근)
+    if (folderId == null || folderId.isEmpty) {
+      return await _getRootSources();
+    }
+
+    // 2. 특정 로컬 폴더 내 파일 및 서브 폴더 조회
+    final targetDir = Directory(folderId);
+    if (!await targetDir.exists()) {
+      return [];
+    }
+
+    final List<MediaItem> folders = [];
+    final List<MediaItem> mediaFiles = [];
+
+    List<FileSystemEntity> entities = [];
+    try {
+      entities = targetDir.listSync(followLinks: true);
+    } on FileSystemException catch (e) {
+      // 심볼릭 링크 추적 실패 시 기본 리스팅 재시도
+      try {
+        entities = targetDir.listSync(followLinks: false);
+      } catch (_) {
+        if (e.osError?.errorCode == 13 || e.message.toLowerCase().contains('permission denied')) {
+          throw Exception('저장소 접근 권한이 필요합니다. 기기 설정에서 앱의 저장소/미디어 권한을 허용해 주세요.');
+        }
+        rethrow;
+      }
+    }
+
+    for (final entity in entities) {
+      final name = _getBasename(entity.path);
+
+      // 숨김 파일 및 시스템 폴더 제외
+      if (name.startsWith('.') ||
+          name.startsWith('\$') ||
+          name.equalsIgnoreCase('System Volume Information') ||
+          name.equalsIgnoreCase('Windows') ||
+          name.equalsIgnoreCase('Recovery') ||
+          name.equalsIgnoreCase('dumpstack.log.tmp')) {
+        continue;
+      }
+
+      bool isDir = false;
+      try {
+        final stat = entity.statSync();
+        isDir = stat.type == FileSystemEntityType.directory;
+      } catch (_) {
+        // stat 실패 시 FileSystemEntity 기본 타입으로 폴백
+        isDir = entity is Directory;
+      }
+
+      if (isDir) {
+        folders.add(
+          MediaItem(
+            id: entity.path,
+            name: name,
+            isFolder: true,
+            parentId: folderId,
+          ),
+        );
+      } else {
+        // 파일이거나 심볼릭 링크인 경우: 비디오 또는 자막인지 검사
+        final tempItem = MediaItem(
+          id: entity.path,
+          name: name,
+          isFolder: false,
+        );
+
+        if (tempItem.isAudio || tempItem.isLyrics || tempItem.isImage) {
+          int? size;
+          DateTime? modified;
+          try {
+            final stat = entity.statSync();
+            size = stat.size;
+            modified = stat.modified;
+          } catch (_) {}
+
+          mediaFiles.add(
+            MediaItem(
+              id: entity.path,
+              name: name,
+              isFolder: false,
+              parentId: folderId,
+              size: size,
+              modifiedTime: modified,
+              directStreamUrl: entity.path,
+            ),
+          );
+        }
+      }
+    }
+
+    // 정렬: 폴더 가나다순, 그 다음 파일 가나다순
+    folders.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    mediaFiles.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+
+    return [...folders, ...mediaFiles];
+  }
+
+  /// 루트(홈) 진입 시 보여줄 드라이브, SD 카드 및 빠른 접근 폴더 목록
+  Future<List<MediaItem>> _getRootSources() async {
+    final List<MediaItem> items = [];
+
+    // [특수 액션] 사용자가 직접 SD 카드나 다른 폴더를 추가할 수 있는 버튼
+    items.add(
+      MediaItem(
+        id: '__ACTION_ADD_STORAGE__',
+        name: '➕ 다른 저장소 / SD 카드 폴더 직접 추가',
+        isFolder: true,
+      ),
+    );
+
+    if (Platform.isWindows) {
+      // 1. Windows 빠른 접근 폴더
+      final userProfile = Platform.environment['USERPROFILE'];
+      if (userProfile != null && userProfile.isNotEmpty) {
+        final quickFolders = [
+          {'name': '📁 음악 폴더', 'sub': 'Music'},
+          {'name': '📁 다운로드 폴더', 'sub': 'Downloads'},
+          {'name': '📁 바탕 화면', 'sub': 'Desktop'},
+          {'name': '📁 문서 폴더', 'sub': 'Documents'},
+        ];
+
+        for (final qf in quickFolders) {
+          final path = '$userProfile\\${qf['sub']}';
+          if (Directory(path).existsSync()) {
+            items.add(
+              MediaItem(
+                id: path,
+                name: qf['name']!,
+                isFolder: true,
+              ),
+            );
+          }
+        }
+      }
+
+      // 2. Windows 드라이브 문자 스캔 (C:\, D:\, 외장 드라이브, USB 등)
+      final drives = [
+        'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K',
+        'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
+        'U', 'V', 'W', 'X', 'Y', 'Z'
+      ];
+
+      for (final letter in drives) {
+        final drivePath = '$letter:\\';
+        try {
+          if (Directory(drivePath).existsSync()) {
+            items.add(
+              MediaItem(
+                id: drivePath,
+                name: '💾 로컬 디스크 ($letter:)',
+                isFolder: true,
+              ),
+            );
+          }
+        } catch (_) {}
+      }
+    } else if (Platform.isAndroid) {
+      // 1. Android 공식 API (getExternalStorageDirectories)로 외장 SD 카드/USB 자동 감지
+      try {
+        final extDirs = await getExternalStorageDirectories();
+        if (extDirs != null) {
+          for (final dir in extDirs) {
+            final path = dir.path;
+            // 경로 예: /storage/ABCD-1234/Android/data/com.example.../files
+            final match = RegExp(r'^(/storage/[^/]+)/Android').firstMatch(path);
+            if (match != null) {
+              final rootPath = match.group(1)!;
+              final bName = _getBasename(rootPath);
+              if (!bName.equalsIgnoreCase('emulated') &&
+                  !bName.equalsIgnoreCase('self') &&
+                  !bName.equalsIgnoreCase('knox')) {
+                if (!items.any((it) => it.id == rootPath)) {
+                  items.add(
+                    MediaItem(
+                      id: rootPath,
+                      name: '💾 외장 SD 카드 ($bName)',
+                      isFolder: true,
+                    ),
+                  );
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
+      // 2. Android 기본 내부 저장소 및 퀵 링크
+      final androidPaths = [
+        {'name': '🎵 내부 저장소 (음악)', 'path': '/storage/emulated/0/Music'},
+        {'name': '📱 다운로드', 'path': '/storage/emulated/0/Download'},
+        {'name': '🎙️ 녹음 / 오디오북 (Audiobooks)', 'path': '/storage/emulated/0/Audiobooks'},
+        {'name': '📱 내부 저장소 전체', 'path': '/storage/emulated/0'},
+      ];
+
+      for (final ap in androidPaths) {
+        final path = ap['path']!;
+        if (Directory(path).existsSync()) {
+          items.add(
+            MediaItem(
+              id: path,
+              name: ap['name']!,
+              isFolder: true,
+            ),
+          );
+        }
+      }
+
+      // 3. /storage 직접 스캔 (추가 SD 카드/OTG 보조 감지)
+      try {
+        final storageDir = Directory('/storage');
+        if (storageDir.existsSync()) {
+          final entries = storageDir.listSync(followLinks: false);
+          for (final entry in entries) {
+            final bName = _getBasename(entry.path);
+            // emulated, self, knox 외의 고유 ID(예: 1234-ABCD)는 마운트된 SD 카드/외장 저장소
+            if (!bName.equalsIgnoreCase('emulated') &&
+                !bName.equalsIgnoreCase('self') &&
+                !bName.equalsIgnoreCase('knox') &&
+                !bName.startsWith('.')) {
+              if (!items.any((it) => it.id == entry.path)) {
+                items.add(
+                  MediaItem(
+                    id: entry.path,
+                    name: '💾 SD 카드 / 외장 저장소 ($bName)',
+                    isFolder: true,
+                  ),
+                );
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
+      // 4. /proc/mounts 파일 파싱하여 마운트된 외장 드라이브 보조 감지
+      try {
+        final mountsFile = File('/proc/mounts');
+        if (mountsFile.existsSync()) {
+          final lines = mountsFile.readAsLinesSync();
+          for (final line in lines) {
+            final parts = line.split(RegExp(r'\s+'));
+            if (parts.length >= 2) {
+              final mountPoint = parts[1];
+              if ((mountPoint.startsWith('/storage/') || mountPoint.startsWith('/mnt/media_rw/')) &&
+                  !mountPoint.contains('emulated') &&
+                  !mountPoint.contains('self')) {
+                if (!items.any((it) => it.id == mountPoint) && Directory(mountPoint).existsSync()) {
+                  final label = _getBasename(mountPoint);
+                  items.add(
+                    MediaItem(
+                      id: mountPoint,
+                      name: '💾 외장 저장소 ($label)',
+                      isFolder: true,
+                    ),
+                  );
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
+    } else {
+      // macOS, Linux 등
+      final home = Platform.environment['HOME'];
+      if (home != null) {
+        final movies = '$home/Movies';
+        final downloads = '$home/Downloads';
+        if (Directory(movies).existsSync()) {
+          items.add(MediaItem(id: movies, name: '📁 동영상', isFolder: true));
+        }
+        if (Directory(downloads).existsSync()) {
+          items.add(MediaItem(id: downloads, name: '📁 다운로드', isFolder: true));
+        }
+        items.add(MediaItem(id: home, name: '📁 홈 폴더', isFolder: true));
+      }
+    }
+
+    // 4. 사용자가 직접 추가한 커스텀 저장소/폴더 목록 불러오기
+    try {
+      final customPaths = await getCustomStoragePaths();
+      for (final cp in customPaths) {
+        if (!items.any((it) => it.id == cp) && Directory(cp).existsSync()) {
+          items.add(
+            MediaItem(
+              id: cp,
+              name: '📂 사용자 추가 저장소 (${_getBasename(cp)})',
+              isFolder: true,
+            ),
+          );
+        }
+      }
+    } catch (_) {}
+
+    return items;
+  }
+
+  /// 사용자가 추가한 커스텀 저장소 경로 목록 조회
+  static Future<List<String>> getCustomStoragePaths() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getStringList(customStoragePrefKey) ?? [];
+  }
+
+  /// 새로운 커스텀 저장소/폴더 경로 추가
+  static Future<void> addCustomStoragePath(String path) async {
+    final prefs = await SharedPreferences.getInstance();
+    final list = prefs.getStringList(customStoragePrefKey) ?? [];
+    if (!list.contains(path)) {
+      list.add(path);
+      await prefs.setStringList(customStoragePrefKey, list);
+    }
+  }
+
+  /// 커스텀 저장소 경로 삭제
+  static Future<void> removeCustomStoragePath(String path) async {
+    final prefs = await SharedPreferences.getInstance();
+    final list = prefs.getStringList(customStoragePrefKey) ?? [];
+    list.remove(path);
+    await prefs.setStringList(customStoragePrefKey, list);
+  }
+
+  String _getBasename(String path) {
+    var clean = path;
+    if (clean.endsWith('\\') || clean.endsWith('/')) {
+      clean = clean.substring(0, clean.length - 1);
+    }
+    final lastSep = clean.lastIndexOf(RegExp(r'[\\/]'));
+    if (lastSep == -1) return clean;
+    return clean.substring(lastSep + 1);
+  }
+
+  @override
+  Future<String> getStreamUrl(MediaItem item) async {
+    return item.id;
+  }
+
+  @override
+  Future<Map<String, String>> getStreamHeaders() async {
+    return const {};
+  }
+
+  @override
+  Future<bool> refreshTokensIfNeeded() async {
+    return true;
+  }
+
+  @override
+  Future<String?> getThumbnailUrl(MediaItem item) async {
+    return null;
+  }
+
+  @override
+  Future<bool> renameItem(MediaItem item, String newName) async {
+    try {
+      final parent = File(item.id).parent.path;
+      final newPath = '$parent${Platform.pathSeparator}$newName';
+      if (item.isFolder) {
+        final dir = Directory(item.id);
+        if (await dir.exists()) {
+          await dir.rename(newPath);
+          return true;
+        }
+      } else {
+        final file = File(item.id);
+        if (await file.exists()) {
+          await file.rename(newPath);
+          return true;
+        }
+      }
+    } catch (e) {
+      debugPrint('[LocalDiskService] 이름 변경 실패: $e');
+    }
+    return false;
+  }
+
+  @override
+  Future<bool> deleteItem(MediaItem item) async {
+    try {
+      if (item.isFolder) {
+        final dir = Directory(item.id);
+        if (await dir.exists()) {
+          await dir.delete(recursive: true);
+          return true;
+        }
+      } else {
+        final file = File(item.id);
+        if (await file.exists()) {
+          await file.delete();
+          return true;
+        }
+      }
+    } catch (e) {
+      debugPrint('[LocalDiskService] 삭제 실패: $e');
+    }
+    return false;
+  }
+
+  @override
+  Future<bool> moveItem(
+    MediaItem item,
+    String targetFolderId, {
+    String? newName,
+    bool overwrite = false,
+  }) async {
+    try {
+      final nameToUse = newName ?? item.name;
+      final newPath = '$targetFolderId${Platform.pathSeparator}$nameToUse';
+      if (item.isFolder) {
+        final dir = Directory(item.id);
+        final targetDir = Directory(newPath);
+        if (await dir.exists()) {
+          if (overwrite && await targetDir.exists() && targetDir.path.toLowerCase() != dir.path.toLowerCase()) {
+            await targetDir.delete(recursive: true);
+          }
+          try {
+            await dir.rename(newPath);
+            return true;
+          } catch (_) {
+            // 다른 디스크/볼륨 간 이동 시 복사 후 삭제 폴백
+            final ok = await copyItem(item, targetFolderId, newName: newName, overwrite: overwrite);
+            if (ok) await deleteItem(item);
+            return ok;
+          }
+        }
+      } else {
+        final file = File(item.id);
+        final targetFile = File(newPath);
+        if (await file.exists()) {
+          if (overwrite && await targetFile.exists() && targetFile.path.toLowerCase() != file.path.toLowerCase()) {
+            await targetFile.delete();
+          }
+          try {
+            await file.rename(newPath);
+            return true;
+          } catch (_) {
+            final ok = await copyItem(item, targetFolderId, newName: newName, overwrite: overwrite);
+            if (ok) await deleteItem(item);
+            return ok;
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('[LocalDiskService] 이동 실패: $e');
+    }
+    return false;
+  }
+
+  @override
+  Future<bool> copyItem(
+    MediaItem item,
+    String targetFolderId, {
+    String? newName,
+    bool overwrite = false,
+  }) async {
+    try {
+      var nameToUse = newName ?? item.name;
+      var newPath = '$targetFolderId${Platform.pathSeparator}$nameToUse';
+
+      // newName이 지정되지 않았고 동일 파일이 이미 존재하며 overwrite가 false인 경우 자동 고유 이름 생성
+      if (newName == null && !overwrite) {
+        final exists = item.isFolder
+            ? await Directory(newPath).exists()
+            : await File(newPath).exists();
+        if (exists) {
+          nameToUse = _getUniqueNameForDisk(targetFolderId, item.name, item.isFolder);
+          newPath = '$targetFolderId${Platform.pathSeparator}$nameToUse';
+        }
+      }
+
+      if (item.isFolder) {
+        final srcDir = Directory(item.id);
+        final dstDir = Directory(newPath);
+        if (await srcDir.exists()) {
+          if (overwrite && await dstDir.exists() && dstDir.path.toLowerCase() != srcDir.path.toLowerCase()) {
+            await dstDir.delete(recursive: true);
+          }
+          await _copyDirectory(srcDir, dstDir);
+          return true;
+        }
+      } else {
+        final srcFile = File(item.id);
+        final dstFile = File(newPath);
+        if (await srcFile.exists()) {
+          if (overwrite && await dstFile.exists() && dstFile.path.toLowerCase() != srcFile.path.toLowerCase()) {
+            await dstFile.delete();
+          }
+          await srcFile.copy(newPath);
+          return true;
+        }
+      }
+    } catch (e) {
+      debugPrint('[LocalDiskService] 복사 실패: $e');
+    }
+    return false;
+  }
+
+  String _getUniqueNameForDisk(String folder, String name, bool isFolder) {
+    String baseName;
+    String extension;
+
+    if (!isFolder && name.contains('.') && name.lastIndexOf('.') > 0) {
+      final dotIndex = name.lastIndexOf('.');
+      baseName = name.substring(0, dotIndex);
+      extension = name.substring(dotIndex);
+    } else {
+      baseName = name;
+      extension = '';
+    }
+
+    String candidate = '$baseName - 복사본$extension';
+    var path = '$folder${Platform.pathSeparator}$candidate';
+    if (!(isFolder ? Directory(path).existsSync() : File(path).existsSync())) {
+      return candidate;
+    }
+
+    int counter = 2;
+    while (true) {
+      candidate = '$baseName - 복사본 ($counter)$extension';
+      path = '$folder${Platform.pathSeparator}$candidate';
+      if (!(isFolder ? Directory(path).existsSync() : File(path).existsSync())) {
+        return candidate;
+      }
+      counter++;
+    }
+  }
+
+  Future<void> _copyDirectory(Directory src, Directory dst) async {
+    if (!await dst.exists()) {
+      await dst.create(recursive: true);
+    }
+    await for (final entity in src.list(recursive: false)) {
+      final name = _getBasename(entity.path);
+      final destPath = '${dst.path}${Platform.pathSeparator}$name';
+      if (entity is Directory) {
+        await _copyDirectory(entity, Directory(destPath));
+      } else if (entity is File) {
+        await entity.copy(destPath);
+      }
+    }
+  }
+
+  @override
+  Future<bool> createFolder(String folderName, {String? parentFolderId}) async {
+    try {
+      if (parentFolderId == null || parentFolderId.isEmpty) return false;
+      final newDir = Directory('$parentFolderId${Platform.pathSeparator}$folderName');
+      if (!await newDir.exists()) {
+        await newDir.create(recursive: true);
+        return true;
+      }
+    } catch (e) {
+      debugPrint('[LocalDiskService] 새 폴더 생성 실패: $e');
+    }
+    return false;
+  }
+}
+
+extension on String {
+  bool equalsIgnoreCase(String other) => toLowerCase() == other.toLowerCase();
+}

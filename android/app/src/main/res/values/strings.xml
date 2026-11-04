@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cloud Audio Player</string>
+    <string name="widget_small_desc">갤럭시 S26+ 위젯 스택용 컴팩트 오디오 컨트롤러 (4x1)</string>
+    <string name="widget_medium_desc">갤럭시 S26+ 위젯 스택 최적화 클라우드 오디오 플레이어 (4x2)</string>
+</resources>

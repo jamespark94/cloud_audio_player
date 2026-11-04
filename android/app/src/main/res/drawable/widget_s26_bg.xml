@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <!-- 갤럭시 S26+ One UI 위젯 스택 곡률(22dp~24dp) 매칭 -->
+    <corners android:radius="22dp" />
+    <gradient
+        android:angle="315"
+        android:startColor="#E6151B28"
+        android:endColor="#F20D111A"
+        android:type="linear" />
+    <stroke
+        android:width="1dp"
+        android:color="#3364FFDA" />
+</shape>
