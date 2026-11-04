@@ -71,7 +71,7 @@ class _AddAccountDialogState extends State<AddAccountDialog> with WidgetsBinding
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _isLoading) {
+    if (state == AppLifecycleState.resumed && _isLoading && _showManualInput) {
       _checkClipboardForAuthCode();
     }
   }
@@ -141,6 +141,53 @@ class _AddAccountDialogState extends State<AddAccountDialog> with WidgetsBinding
 
   Future<void> _startOAuth() async {
     if (_selectedType == null) return;
+
+    // 모바일(Android/iOS)에서 커스텀 API 키 없이 Google Drive를 연결하는 경우 네이티브 로그인으로 진행
+    if (_selectedType == CloudType.googleDrive &&
+        (Platform.isAndroid || Platform.isIOS) &&
+        _clientIdController.text.trim().isEmpty) {
+      setState(() {
+        _isLoading = true;
+        _errorMessage = null;
+        _statusMessage = 'Google 계정 연결을 진행합니다...';
+      });
+      try {
+        final googleAccount = await GoogleAuthManager().signIn();
+        if (!mounted) return;
+        if (googleAccount == null) {
+          setState(() {
+            _isLoading = false;
+            _statusMessage = null;
+          });
+          return;
+        }
+        final navigator = Navigator.of(context);
+        final accountMgr = context.read<AccountManager>();
+        final token = await GoogleAuthManager().getAccessToken() ?? '';
+        final account = CloudAccount(
+          id: 'gdrive_${googleAccount.id}',
+          name: 'Google Drive (${googleAccount.displayName ?? googleAccount.email})',
+          type: CloudType.googleDrive,
+          email: googleAccount.email,
+          accessToken: token,
+          refreshToken: 'google_sign_in',
+          tokenExpiry: DateTime.now().add(const Duration(minutes: 55)),
+        );
+        await accountMgr.saveAccount(account);
+        if (mounted) {
+          navigator.pop(true);
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+            _statusMessage = null;
+            _errorMessage = '$e';
+          });
+        }
+      }
+      return;
+    }
 
     _manualRevealTimer?.cancel();
     _manualRevealTimer = Timer(const Duration(seconds: 2), () {
@@ -1582,22 +1629,27 @@ class _AddAccountDialogState extends State<AddAccountDialog> with WidgetsBinding
                   },
                   onError: (err) {
                     final errStr = err.toString();
-                    if (errStr.contains('10') || errStr.contains('sign_in_failed') || errStr.contains('DEVELOPER_ERROR')) {
-                      _startOAuth();
+                    debugPrint('[AddAccountDialog] GoogleLoginButton error: $errStr');
+                    if (mounted) {
+                      setState(() {
+                        _errorMessage = 'Google 계정 연결 실패: $errStr';
+                      });
                     }
                   },
                 ),
               ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                height: 44,
-                child: OutlinedButton.icon(
-                  onPressed: _startOAuth,
-                  icon: const Icon(Icons.open_in_browser, size: 18),
-                  label: const Text('인앱 브라우저로 로그인 및 연결'),
+              if (_clientIdController.text.trim().isNotEmpty) ...[
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  height: 44,
+                  child: OutlinedButton.icon(
+                    onPressed: _startOAuth,
+                    icon: const Icon(Icons.open_in_browser, size: 18),
+                    label: const Text('커스텀 API 키로 브라우저 로그인'),
+                  ),
                 ),
-              ),
+              ],
             ] else ...[
               SizedBox(
                 width: double.infinity,

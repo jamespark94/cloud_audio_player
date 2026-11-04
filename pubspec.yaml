@@ -2,7 +2,7 @@ name: cloud_audio_player
 description: "Cloud Audio Player with Background Streaming & Galaxy S26+ Widget Stack Support."
 publish_to: 'none'
 
-version: 1.0.0+1001
+version: 1.0.0+3002
 
 environment:
   sdk: ^3.13.5
