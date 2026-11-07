@@ -142,9 +142,9 @@ class _AddAccountDialogState extends State<AddAccountDialog> with WidgetsBinding
   Future<void> _startOAuth() async {
     if (_selectedType == null) return;
 
-    // 모바일(Android/iOS)에서 커스텀 API 키 없이 Google Drive를 연결하는 경우 네이티브 로그인으로 진행
+    // 안드로이드에서 커스텀 API 키 없이 Google Drive를 연결하는 경우 네이티브 로그인으로 진행 (iOS는 브라우저 OAuth 사용)
     if (_selectedType == CloudType.googleDrive &&
-        (Platform.isAndroid || Platform.isIOS) &&
+        Platform.isAndroid &&
         _clientIdController.text.trim().isEmpty) {
       setState(() {
         _isLoading = true;
